@@ -21,53 +21,33 @@ if (!supabaseUrl || !supabaseKey) {
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 /**
- * 1. [API] 플레이어 상태 검증 (게임 실행 시 차단 확인)
- * POST /api/validate-status
+ * [Utility] 보안 로그 기록 함수
+ * 보안 관련 모든 중요 이벤트를 DB에 기록하여 사후 추적 가능하게 함
  */
-app.post('/api/validate-status', async (req, res) => {
-    const { uuid, hwid } = req.body;
-
-    if (!uuid || !hwid) {
-        return res.status(400).json({ isClean: false, message: "잘못된 요청 인자입니다." });
-    }
-
+async function logSecurityEvent(type, details) {
     try {
-        // 차단 테이블(banned_targets)에서 UUID 혹은 HWID가 등록되어 있는지 조회
-        const { data: banRecord, error } = await supabase
-            .from('banned_targets')
-            .select('reason')
-            .or(`target_value.eq.${uuid},target_value.eq.${hwid}`)
-            .maybeSingle();
-
-        if (error) throw error;
-
-        if (banRecord) {
-            // 차단된 내역이 존재함
-            return res.json({ isClean: false, reason: banRecord.reason });
-        }
-
-        // 차단되지 않은 정상 유저
-        return res.json({ isClean: true });
-
+        await supabase.from('security_logs').insert({
+            event_type: type, // 예: 'VALIDATION', 'VIOLATION', 'ADMIN_AUTH'
+            details: details,
+            created_at: new Date().toISOString()
+        });
     } catch (err) {
-        console.error("차단 상태 조회 중 서버 에러:", err);
-        return res.status(500).json({ isClean: false, message: "서버 내부 오류가 발생했습니다." });
+        console.error("❌ 로그 기록 실패:", err);
     }
-});
+}
 
 /**
- * 2. [API] 실시간 보안 하트비트 수신 및 다중 계정 탐지
- * POST /api/heartbeat
+ * 1. [API] 플레이어 상태 검증
+ * 게임 실행 시 차단 여부와 계정 상태를 실시간 체크
  */
-app.post('/api/heartbeat', async (req, res) => {
-    const { uuid, hwid, username, adminToken } = req.body;
+app.post('/api/validate-status', async (req, res) => {
+    const { uuid, hwid, username } = req.body;
 
     if (!uuid || !hwid) {
-        return res.status(400).json({ status: "ERROR", message: "필수 인자가 누락되었습니다." });
+        return res.status(400).json({ isClean: false, message: "잘못된 요청입니다." });
     }
 
     try {
-        // [검증 1] 차단된 유저인지 실시간 재체크
         const { data: banRecord } = await supabase
             .from('banned_targets')
             .select('reason')
@@ -75,11 +55,43 @@ app.post('/api/heartbeat', async (req, res) => {
             .maybeSingle();
 
         if (banRecord) {
+            await logSecurityEvent('BLOCK_ATTEMPT', { uuid, hwid, reason: banRecord.reason });
+            return res.json({ isClean: false, reason: banRecord.reason });
+        }
+
+        await logSecurityEvent('VALIDATION_SUCCESS', { uuid, hwid, username });
+        return res.json({ isClean: true });
+
+    } catch (err) {
+        await logSecurityEvent('SYSTEM_ERROR', { error: err.message });
+        return res.status(500).json({ isClean: false, message: "서버 오류" });
+    }
+});
+
+/**
+ * 2. [API] 실시간 보안 하트비트 및 다중 계정 탐지
+ */
+app.post('/api/heartbeat', async (req, res) => {
+    const { uuid, hwid, username, adminToken } = req.body;
+
+    if (!uuid || !hwid) {
+        return res.status(400).json({ status: "ERROR", message: "인자 누락" });
+    }
+
+    try {
+        // [검증 1] 차단 재체크
+        const { data: banRecord } = await supabase
+            .from('banned_targets')
+            .select('reason')
+            .or(`target_value.eq.${uuid},target_value.eq.${hwid}`)
+            .maybeSingle();
+
+        if (banRecord) {
+            await logSecurityEvent('BANNED_USER_HEARTBEAT', { uuid, hwid });
             return res.json({ status: "BANNED", reason: banRecord.reason });
         }
 
-        // [검증 2] 다중 계정 접속 우회 탐지 (동일 HWID로 다른 UUID 세션이 활성화되어 있는지 검사)
-        // 최근 10분 이내에 동일한 HWID로 접속한 다른 UUID 계정이 있는지 조회
+        // [검증 2] 다중 계정 탐지
         const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
         const { data: activeSessions } = await supabase
             .from('player_heartbeats')
@@ -90,17 +102,15 @@ app.post('/api/heartbeat', async (req, res) => {
 
         if (activeSessions && activeSessions.length > 0) {
             const dynamicUsers = activeSessions.map(s => s.username).join(', ');
-            console.log(`[⚠️ 경고] 다중 계정 유저 감지됨. HWID: ${hwid} (현재: ${username} / 동시 감지: ${dynamicUsers})`);
-
-            // 정책에 따라 즉시 차단(banned_targets에 추가) 하거나, 경고 응답을 내보낼 수 있습니다.
-            // 여기서는 런처에 다중 접속 탐지 상태를 반환하여 프로세스를 강제 종료하도록 유도합니다.
+            await logSecurityEvent('VIOLATION_MULTIPLE_ACCOUNT', { hwid, username, conflict: dynamicUsers });
+            
             return res.json({
                 status: "VIOLATION",
-                reason: `하나의 PC에서 다중 계정 접속이 감지되었습니다. (동시 구동 계정: ${dynamicUsers})`
+                reason: `다중 계정 접속 감지: ${dynamicUsers}`
             });
         }
 
-        // [검증 3] 관리자 토큰(코드)이 함께 전달된 경우 유효성 검사 및 로깅
+        // [검증 3] 관리자 인증 로직
         if (adminToken) {
             const { data: validCode } = await supabase
                 .from('admin_codes')
@@ -110,37 +120,30 @@ app.post('/api/heartbeat', async (req, res) => {
                 .maybeSingle();
 
             if (validCode) {
-                console.log(`[👑 관리자 인증 성공] 유저명: ${username} (${uuid})이(가) 유효한 관리자 코드를 제출했습니다.`);
+                await logSecurityEvent('ADMIN_AUTH_SUCCESS', { username, uuid });
             } else {
-                console.log(`[❌ 관리자 인증 실패] 유저명: ${username}이(가) 변조되었거나 만료된 코드(${adminToken})를 송신함.`);
+                await logSecurityEvent('ADMIN_AUTH_FAILED', { username, uuid, attempt: adminToken });
             }
         }
 
-        // [갱신] 현재 유저의 하트비트 세션 상태 정보 Upsert (저장 혹은 시간 갱신)
-        const { error: upsertError } = await supabase
-            .from('player_heartbeats')
-            .upsert({
-                player_uuid: uuid,
-                hwid: hwid,
-                username: username,
-                last_seen: new Date().toISOString()
-            }, { onConflict: 'player_uuid' });
-
-        if (upsertError) throw upsertError;
+        // [갱신] 하트비트 타임스탬프 업데이트
+        await supabase.from('player_heartbeats').upsert({
+            player_uuid: uuid,
+            hwid: hwid,
+            username: username,
+            last_seen: new Date().toISOString()
+        }, { onConflict: 'player_uuid' });
 
         return res.json({ status: "OK" });
 
     } catch (err) {
-        console.error("하트비트 처리 중 서버 에러:", err);
-        return res.status(500).json({ status: "ERROR", message: "서버 내부 오류" });
+        console.error("하트비트 에러:", err);
+        return res.status(500).json({ status: "ERROR" });
     }
 });
 
-// 기본 헬스체크 엔드포인트
-app.get('/', (req, res) => {
-    res.send('🔒 MRS Launcher Security Cloud Server is Running safely.');
-});
+app.get('/', (req, res) => res.send('🔒 MRS Security Server Active.'));
 
 app.listen(PORT, () => {
-    console.log(`[시작] MRS 보안 백엔드가 포트 ${PORT}에서 성공적으로 가동되었습니다.`);
+    console.log(`[시작] 보안 백엔드가 포트 ${PORT}에서 작동 중입니다.`);
 });
